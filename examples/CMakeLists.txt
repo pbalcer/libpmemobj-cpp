@@ -129,6 +129,13 @@ if (TEST_VECTOR)
 	endif()
 endif()
 
+find_package(OpenMP)
+if (OPENMP_FOUND)
+        add_example(vecs vecs/vecs.cpp)
+        target_link_libraries(example-vecs ${OPENMP_LIBRARIES})
+        target_compile_options(example-vecs PRIVATE ${OPENMP_CXX_FLAGS}) 
+endif()
+
 if(CURSES_FOUND)
 	add_example(pman pman/pman.cpp)
 	target_include_directories(example-pman PUBLIC ${CURSES_INCLUDE_DIR})
