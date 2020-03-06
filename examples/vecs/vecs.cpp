@@ -40,6 +40,7 @@
 #include <libpmemobj++/pool.hpp>
 #include <libpmemobj++/transaction.hpp>
 #include <libpmemobj++/container/segment_vector.hpp>
+#include <libpmemobj++/container/concurrent_hash_map.hpp>
 #include <libpmemobj_cpp_examples_common.hpp>
 #include <stdexcept>
 #include <string>
@@ -57,18 +58,16 @@ namespace
 
 enum vecs_op {
 	UNKNOWN_VECS_OP,
-	VECS_POPULATE,
+	VECS_INSERT,
 	VECS_DROP,
 	VECS_ITERATE,
-	VECS_ITERATE_MT,
-	VECS_ITERATE_OMP,
 
 	MAX_VECS_OP,
 };
 
 /* vecs operations strings */
 const char *ops_str[MAX_VECS_OP] =
-	{"", "populate", "drop", "iter", "iter_mt", "iter_omp"};
+	{"", "insert", "drop", "iter"};
 
 /*
  * parse_vecs_op -- parses the operation string and returns matching queue_op
@@ -85,85 +84,85 @@ parse_vecs_op(const char *str)
 }
 
 namespace pobj = pmem::obj;
+using object_key_type = pobj::p<uint64_t>;
 
 namespace examples
 {
 
 static const size_t OBJECT_DATA_LEN = (1 << 14); /* 16kb */
+static const size_t NTHREADS = 8;
 
-struct foo {
-	foo(uint64_t _pos) : pos(_pos) {
-	}
-	uint64_t pos;
+struct object_value {
 	pobj::array<uint8_t, OBJECT_DATA_LEN> data;
 };
 
-class root {
-	pobj::segment_vector<foo, pobj::fixed_size_vector_policy<1024>> foos;
+struct object_collection {
+    pobj::segment_vector<object_value, pobj::fixed_size_vector_policy<1024>> vec;
+};
 
+using object_map_type = pobj::concurrent_hash_map<object_key_type, object_collection>;
+
+class persistent_sink {
 public:
-	void populate() {
-		size_t n_sum = 0;
-		for (size_t n = 0; ; ++n) {
-			try {
-				foos.emplace_back(n);
-			} catch (pmem::transaction_error &err) {
-				std::cout << err.what() << std::endl;
-				break;
-			}
-			n_sum += n;
-		}
-		std::cout << n_sum << std::endl;
-		
-	}
+    void init(pmem::obj::pool_base &pop) {
+        if (object_map == nullptr) {
+            pmem::obj::transaction::run(pop, [&] {
+                object_map = pobj::make_persistent<object_map_type>();
+            });
+        }
+        object_map->runtime_initialize();
+    }
 
-	void drop(void) {
-		foos.clear();
-	}
+    void insert(object_key_type key, object_value value) {
+        object_map_type::accessor accessor;
+        object_map->insert(accessor, key);
+        auto c = &accessor->second;
 
-	void iter(void) {
-		size_t n_sum = 0;
-		for (auto const iter: foos) {
-			n_sum += iter.pos;
-		}
-		std::cout << n_sum << std::endl;
-	}
+        c->vec.emplace_back(value);
+    }
 
-	void iter_omp(void) {
-		size_t n_sum = 0;
+    bool foreach(object_key_type key, std::function<void(const object_value &value)> cb) {
+        object_map_type::const_accessor accessor;
+        if (!object_map->find(accessor, key))
+            return false;
 
-		#pragma omp parallel for
-		for (size_t i = 0; i < foos.size(); ++i)
-			#pragma omp atomic update
-			n_sum += foos.const_at(i).pos;
+        auto c = &accessor->second;
 
-		std::cout << n_sum << std::endl;
-	}
+        std::vector<std::future<void>> futures;
+        auto itr = c->vec.cbegin();
+        size_t partsize = c->vec.size() > NTHREADS ? c->vec.size() / NTHREADS : c->vec.size();
 
-	void iter_mt(size_t parts) {
-		std::vector<std::future<size_t>> n_sums;
-		auto itr = foos.cbegin();
-		size_t partsize = foos.size() / parts;
-		do {
-			size_t r = (size_t)std::distance(itr, foos.cend());
-			auto partial_iter_end = itr +
-				(ssize_t)std::min(r, partsize);
-			n_sums.emplace_back(std::async(std::launch::async, [=] {
-				size_t n_sum = 0;
-				for (auto n = itr; n != partial_iter_end; ++n)
-					n_sum += n->pos;
+        do {
+            size_t r = (size_t)std::distance(itr, c->vec.cend());
+            auto partial_iter_end = itr +
+                                    (ssize_t)std::min(r, partsize);
+            futures.emplace_back(std::async(std::launch::async, [=] {
+                for (auto n = itr; n != partial_iter_end; ++n)
+                    cb((*n));
+            }));
+            itr = partial_iter_end;
+        } while (itr != c->vec.cend());
 
-				return n_sum;
-			}));
-			itr = partial_iter_end;
-		} while (itr != foos.cend());
+        for (auto &iter: futures)
+            iter.wait();
 
-		size_t n_sum = 0;
-		for (auto &iter: n_sums)
-			n_sum += iter.get();
+        return true;
+    }
 
-		std::cout << n_sum << std::endl;
-	}
+    int drop(object_key_type key) {
+        object_map_type::accessor accessor;
+        if (!object_map->find(accessor, key))
+            return false;
+
+        auto c = &accessor->second;
+
+        c->vec.clear();
+
+        return 0;
+    }
+
+private:
+    pobj::persistent_ptr<object_map_type> object_map;
 };
 
 } /* namespace examples */
@@ -182,31 +181,32 @@ main(int argc, char *argv[])
 
 	vecs_op op = parse_vecs_op(argv[2]);
 
-	pobj::pool<examples::root> pop;
+	pobj::pool<examples::persistent_sink> pop;
 
 	if (file_exists(path) != 0) {
-		pop = pobj::pool<examples::root>::create(
-			path, LAYOUT, PMEMOBJ_MIN_POOL * 1000, CREATE_MODE_RW);
+		pop = pobj::pool<examples::persistent_sink>::create(
+			path, LAYOUT, PMEMOBJ_MIN_POOL * 10, CREATE_MODE_RW);
 	} else {
-		pop = pobj::pool<examples::root>::open(path, LAYOUT);
+		pop = pobj::pool<examples::persistent_sink>::open(path, LAYOUT);
 	}
 
+	object_key_type ktype = 1234;
+	examples::object_value empty_object {};
+
 	auto v = pop.root();
+	v->init(pop);
+
 	switch (op) {
-		case VECS_POPULATE:
-			v->populate();
+		case VECS_INSERT:
+		    v->insert(ktype, empty_object);
 			break;
 		case VECS_DROP:
-			v->drop();
+		    v->drop(ktype);
 			break;
 		case VECS_ITERATE:
-			v->iter();
-			break;
-		case VECS_ITERATE_MT:
-			v->iter_mt(8);
-			break;
-		case VECS_ITERATE_OMP:
-			v->iter_omp();
+		    v->foreach(ktype, [] (const examples::object_value &) {
+                std::cout << "object callback" << std::endl;
+            });
 			break;
 		default:
 			throw std::invalid_argument("invalid vecs operation");
