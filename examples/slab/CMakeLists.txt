@@ -30,7 +30,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 cmake_minimum_required(VERSION 3.3)
-project(vecs CXX)
+project(slab CXX)
 
 set(CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 11)
@@ -49,9 +49,8 @@ endif()
 
 link_directories(${LIBPMEMOBJ++_LIBRARY_DIRS})
 
-add_executable(vecs vecs.cpp)
+add_executable(slab slab.cpp)
 
-
-target_compile_options(vecs PUBLIC)
-target_include_directories(vecs PUBLIC ${LIBPMEMOBJ++_INCLUDE_DIRS} . ..)
-target_link_libraries(vecs ${LIBPMEMOBJ++_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+target_compile_options(slab PUBLIC)
+target_include_directories(slab PUBLIC ${LIBPMEMOBJ++_INCLUDE_DIRS} . ..)
+target_link_libraries(slab ${LIBPMEMOBJ++_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
